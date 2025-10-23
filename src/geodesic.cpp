@@ -258,7 +258,7 @@ static void drawPath(){
   glEnd();
 }
 
-static void displayCB(){
+static void display(){
   glViewport(0,0,winW,winH);
   glClearColor(0.07f,0.08f,0.10f,1.0f);
   glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -271,13 +271,13 @@ static void displayCB(){
   glutSwapBuffers();
 }
 
-static void reshapeCB(int w,int h){
+static void reshape(int w,int h){
   winW=w; winH=h>0?h:1;
   glutPostRedisplay();
 }
 
 // ---------- Keyboard ----------
-static void keyboardCB(unsigned char key,int,int){
+static void keyboard(unsigned char key,int,int){
   switch(key){
     case 27: std::exit(0); break;
     case 'r': case 'R': pickRandomEndpoints(); recomputePath(); glutPostRedisplay(); break;
@@ -287,13 +287,13 @@ static void keyboardCB(unsigned char key,int,int){
   }
 }
 
-static void mouseButtonCB(int button,int state,int x,int y){
+static void mouse(int button,int state,int x,int y){
   if (button == GLUT_LEFT_BUTTON)  lbtn = (state == GLUT_DOWN);
   if (button == GLUT_RIGHT_BUTTON) rbtn = (state == GLUT_DOWN);
   lastX = x; lastY = y;
 }
 
-static void motionCB(int x,int y){
+static void motion(int x,int y){
   int dx = x - lastX;
   int dy = y - lastY;
   lastX = x; lastY = y;
@@ -314,7 +314,7 @@ static void motionCB(int x,int y){
 }
 
 #if defined(FREEGLUT)
-static void mouseWheelCB(int wheel, int direction, int x, int y){
+static void mouse_wheel(int wheel, int direction, int x, int y){
   camDist *= (direction > 0) ? 0.9f : 1.1f;
   if (camDist < 1e-3f) camDist = 1e-3f;
   glutPostRedisplay();
@@ -355,17 +355,17 @@ int main(int argc,char** argv){
   glutInit(&argc, argv);
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
   glutInitWindowSize(winW, winH);
-  glutCreateWindow("Shortest Path on Mesh (Dijkstra 1-skeleton) - freeglut + glm");
+  glutCreateWindow("Shortest Path on Mesh (Dijkstra 1-skeleton)");
 
   usage();
 
-  glutDisplayFunc(displayCB);
-  glutReshapeFunc(reshapeCB);
-  glutKeyboardFunc(keyboardCB);
-  glutMouseFunc(mouseButtonCB);
-  glutMotionFunc(motionCB);
+  glutDisplayFunc(display);
+  glutReshapeFunc(reshape);
+  glutKeyboardFunc(keyboard);
+  glutMouseFunc(mouse);
+  glutMotionFunc(motion);
 #if defined(FREEGLUT)
-  glutMouseWheelFunc(mouseWheelCB);
+  glutMouseWheelFunc(mouse_wheel);
 #endif
 
   glEnable(GL_POINT_SMOOTH);
