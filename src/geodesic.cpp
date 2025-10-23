@@ -1,8 +1,9 @@
-// main.cpp
+// geodesic.cpp
 // Minimal .obj triangle mesh viewer + graph shortest path (Dijkstra on 1-skeleton)
 // Libraries: freeglut, OpenGL (fixed pipeline), glm
 // Usage: ./app model.obj
-// Keys: r (re-sample random endpoints), w/s zoom, arrows pan, mouse drag rotate, q/Esc quit
+// Keys: r (re-sample random endpoints), +/- zoom, arrows pan, mouse: L-rotate / R-pan, Esc quit
+// Mouse wheel zoom is available on FREEGLUT
 
 #if defined(WIN32)
 #pragma warning(disable:4996)
@@ -70,7 +71,8 @@ static glm::vec3 sceneCenter(0.0f);
 static float yaw=0.0f, pitch=0.0f; // radians
 static float panX=0.0f, panY=0.0f;
 static int lastX=-1, lastY=-1;
-static bool dragging=false;
+
+static bool lbtn=false, rbtn=false;
 
 // path
 static int srcIdx=-1, dstIdx=-1;
@@ -100,14 +102,13 @@ static bool loadOBJ(const std::string& path, Mesh& M){
       float x,y,z; ss>>x>>y>>z;
       verts.emplace_back(x,y,z);
     } else if(tag=="f"){
-      // accept formats: f i j k  or f i/... j/... k/...
       auto readIndex = [&](const std::string& tok)->int{
         std::stringstream s(tok);
         std::string a; std::getline(s,a,'/');
         if(a.empty()) return -1;
         int idx = std::stoi(a);
-        if(idx<0) idx = (int)verts.size()+idx+1; // negative indices
-        return idx-1; // to 0-based
+        if(idx<0) idx = (int)verts.size()+idx+1;
+        return idx-1;
       };
       std::string a,b,c; ss>>a>>b>>c;
       if(a.empty()||b.empty()||c.empty()) continue;
@@ -166,7 +167,6 @@ static bool shortestPath(const Graph& G, int s, int t, std::vector<int>& outPath
     }
   }
   if(dist[t]==FLT_MAX) return false;
-  // backtrack
   outPath.clear();
   for(int cur=t; cur!=-1; cur=prev[cur]) outPath.push_back(cur);
   std::reverse(outPath.begin(), outPath.end());
@@ -185,7 +185,6 @@ static void recomputePath(){
   pathVerts.clear();
   bool ok = shortestPath(gGraph, srcIdx, dstIdx, pathVerts);
   if(!ok){
-    // fall back: re-pick until success (should always connect on manifold-ish mesh)
     for(int tries=0; tries<20 && !ok; ++tries){
       pickRandomEndpoints();
       ok = shortestPath(gGraph, srcIdx, dstIdx, pathVerts);
@@ -209,25 +208,14 @@ static void setProjection(){
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
 
-  // camera transform: orbit around sceneCenter by yaw/pitch, then translate by pan and camDist
   glm::mat4 I(1.0f);
   glm::mat4 Tpan = glm::translate(I, glm::vec3(panX, panY, 0.0f));
   glm::mat4 R = glm::yawPitchRoll(yaw, pitch, 0.0f);
   glm::vec3 eye = sceneCenter + glm::vec3(R*glm::vec4(0,0,camDist,1));
   glm::mat4 V = glm::lookAt(eye, sceneCenter, glm::vec3(0,1,0));
-  glm::mat4 M = Tpan; // allow panning in view space
-  glm::mat4 MV = V * M;
+  glm::mat4 MV = V * Tpan;
 
   glLoadMatrixf(&MV[0][0]);
-}
-
-static void drawAxes(float s=1.0f){
-  glLineWidth(2.0f);
-  glBegin(GL_LINES);
-  glColor3f(1,0,0); glVertex3f(sceneCenter.x, sceneCenter.y, sceneCenter.z); glVertex3f(sceneCenter.x+s, sceneCenter.y, sceneCenter.z);
-  glColor3f(0,1,0); glVertex3f(sceneCenter.x, sceneCenter.y, sceneCenter.z); glVertex3f(sceneCenter.x, sceneCenter.y+s, sceneCenter.z);
-  glColor3f(0,0,1); glVertex3f(sceneCenter.x, sceneCenter.y, sceneCenter.z); glVertex3f(sceneCenter.x, sceneCenter.y, sceneCenter.z+s);
-  glEnd();
 }
 
 static void drawMeshWire(){
@@ -259,13 +247,12 @@ static void drawPath(){
   }
   glEnd();
 
-  // draw endpoints as small points
   glPointSize(8.0f);
   glBegin(GL_POINTS);
-  glColor3f(0.1f,0.9f,0.2f); // source
+  glColor3f(0.1f,0.9f,0.2f);
   auto ps=gMesh.V[pathVerts.front()];
   glVertex3f(ps.x,ps.y,ps.z);
-  glColor3f(0.1f,0.6f,1.0f); // target
+  glColor3f(0.1f,0.6f,1.0f);
   auto pt=gMesh.V[pathVerts.back()];
   glVertex3f(pt.x,pt.y,pt.z);
   glEnd();
@@ -278,8 +265,6 @@ static void displayCB(){
   glEnable(GL_DEPTH_TEST);
 
   setProjection();
-  // drawAxes( (float)glm::length(gMesh.bbmax-gMesh.bbmin)*0.2f );
-
   drawMeshWire();
   drawPath();
 
@@ -291,41 +276,69 @@ static void reshapeCB(int w,int h){
   glutPostRedisplay();
 }
 
+// ---------- Keyboard ----------
 static void keyboardCB(unsigned char key,int,int){
   switch(key){
-    case 'q': case 27: std::exit(0); break;
-    case 'r': pickRandomEndpoints(); recomputePath(); glutPostRedisplay(); break;
-    case 'w': camDist *= 0.9f; glutPostRedisplay(); break;
-    case 's': camDist *= 1.111f; glutPostRedisplay(); break;
+    case 27: std::exit(0); break;
+    case 'r': case 'R': pickRandomEndpoints(); recomputePath(); glutPostRedisplay(); break;
+    case '+': camDist *= 0.9f; glutPostRedisplay(); break;
+    case '-': camDist *= 1.1f; glutPostRedisplay(); break;
     default: break;
   }
 }
 
-static void specialCB(int key,int,int){
-  float step = 0.02f * camDist;
-  if(key==GLUT_KEY_LEFT)  panX -= step;
-  if(key==GLUT_KEY_RIGHT) panX += step;
-  if(key==GLUT_KEY_UP)    panY += step;
-  if(key==GLUT_KEY_DOWN)  panY -= step;
-  glutPostRedisplay();
-}
-
-static void mouseCB(int button,int state,int x,int y){
-  if(button==GLUT_LEFT_BUTTON){
-    if(state==GLUT_DOWN){ dragging=true; lastX=x; lastY=y; }
-    else { dragging=false; }
-  }
+static void mouseButtonCB(int button,int state,int x,int y){
+  if (button == GLUT_LEFT_BUTTON)  lbtn = (state == GLUT_DOWN);
+  if (button == GLUT_RIGHT_BUTTON) rbtn = (state == GLUT_DOWN);
+  lastX = x; lastY = y;
 }
 
 static void motionCB(int x,int y){
-  if(!dragging) return;
-  float dx = (x - lastX) / (float)winW;
-  float dy = (y - lastY) / (float)winH;
-  lastX=x; lastY=y;
-  yaw   += dx * 2.5f;
-  pitch += dy * 2.0f;
-  pitch = std::max(-1.55f, std::min(1.55f, pitch));
+  int dx = x - lastX;
+  int dy = y - lastY;
+  lastX = x; lastY = y;
+
+  if (lbtn) { // rotate(yaw/pitch)
+    yaw   += dx * 0.005f;
+    pitch += dy * 0.005f;
+    const float lim = 1.55f;
+    if (pitch >  lim) pitch =  lim;
+    if (pitch < -lim) pitch = -lim;
+  }
+  if (rbtn) { // pan
+    float s = 0.002f * camDist;
+    panX += dx * s;
+    panY -= dy * s;
+  }
   glutPostRedisplay();
+}
+
+#if defined(FREEGLUT)
+static void mouseWheelCB(int wheel, int direction, int x, int y){
+  camDist *= (direction > 0) ? 0.9f : 1.1f;
+  if (camDist < 1e-3f) camDist = 1e-3f;
+  glutPostRedisplay();
+}
+#endif
+
+static void usage(){
+  std::puts("=== Geodesic (Shortest Path on Mesh) ===");
+  std::puts("\nMouse:");
+  std::puts("  Left-drag   : rotate camera (yaw/pitch)");
+  std::puts("  Right-drag  : pan");
+#if defined(FREEGLUT)
+  std::puts("  Wheel       : zoom");
+#endif
+
+  std::puts("\nKeyboard:");
+  std::puts("  R           : re-sample random endpoints");
+  std::puts("  + / -       : zoom in / out");
+  std::puts("  ESC         : quit");
+
+  std::puts("\nNotes:");
+  std::puts("  - This demo computes a shortest path on the 1-skeleton (Dijkstra).");
+  std::puts("  - Use as a baseline before adding Steiner points / on-face edges.");
+  std::puts("");
 }
 
 int main(int argc,char** argv){
@@ -343,12 +356,17 @@ int main(int argc,char** argv){
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
   glutInitWindowSize(winW, winH);
   glutCreateWindow("Shortest Path on Mesh (Dijkstra 1-skeleton) - freeglut + glm");
+
+  usage();
+
   glutDisplayFunc(displayCB);
   glutReshapeFunc(reshapeCB);
   glutKeyboardFunc(keyboardCB);
-  glutSpecialFunc(specialCB);
-  glutMouseFunc(mouseCB);
+  glutMouseFunc(mouseButtonCB);
   glutMotionFunc(motionCB);
+#if defined(FREEGLUT)
+  glutMouseWheelFunc(mouseWheelCB);
+#endif
 
   glEnable(GL_POINT_SMOOTH);
   glEnable(GL_LINE_SMOOTH);
