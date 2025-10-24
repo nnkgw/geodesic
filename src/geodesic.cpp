@@ -56,8 +56,7 @@ struct Mesh {
   glm::vec3 bbmin{FLT_MAX}, bbmax{-FLT_MAX};
 };
 
-struct Graph {
-  // adjacency list on 1-skeleton
+struct Graph { // adjacency list on 1-skeleton
   std::vector<std::vector<std::pair<int,float>>> adj; // (neighbor, length)
 };
 
@@ -137,7 +136,7 @@ static void buildGraph(const Mesh& M, Graph& G){
   std::unordered_set<EdgeKey,EdgeKeyHash> used;
   used.reserve(M.F.size()*3);
   for(auto &f: M.F){
-    int id[3]={f.x,f.y,f.z};
+    int id[3]={f.x,f.y,f.z}; // triangle vtx0, vtx1, vtx2
     for(int e=0;e<3;++e){
       int i=id[e], j=id[(e+1)%3];
       EdgeKey key(i,j);
