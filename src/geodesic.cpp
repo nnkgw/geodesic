@@ -61,6 +61,10 @@ struct Graph {
   std::vector<std::vector<std::pair<int,float>>> adj; // (neighbor, length)
 };
 
+// Include Dijkstra implementation AFTER Graph is defined.
+// This keeps compile errors away (the header needs the full definition of Graph).
+#include "dijkstra.h"
+
 static Mesh gMesh;
 static Graph gGraph;
 
@@ -147,31 +151,7 @@ static void buildGraph(const Mesh& M, Graph& G){
   }
 }
 
-// Dijkstra from s to t, store path of vertex indices
-static bool shortestPath(const Graph& G, int s, int t, std::vector<int>& outPath){
-  const int n = (int)G.adj.size();
-  std::vector<float> dist(n, FLT_MAX);
-  std::vector<int> prev(n, -1);
-  using Node=std::pair<float,int>;
-  std::priority_queue<Node, std::vector<Node>, std::greater<Node>> pq;
-  dist[s]=0.0f; pq.push({0.0f,s});
-  while(!pq.empty()){
-    auto [d,u]=pq.top(); pq.pop();
-    if(d>dist[u]) continue;
-    if(u==t) break;
-    for(auto& [v,w]: G.adj[u]){
-      float nd=d+w;
-      if(nd<dist[v]){
-        dist[v]=nd; prev[v]=u; pq.push({nd,v});
-      }
-    }
-  }
-  if(dist[t]==FLT_MAX) return false;
-  outPath.clear();
-  for(int cur=t; cur!=-1; cur=prev[cur]) outPath.push_back(cur);
-  std::reverse(outPath.begin(), outPath.end());
-  return true;
-}
+// shortestPath(...) is now provided by dijkstra.h
 
 static void pickRandomEndpoints(){
   std::uniform_int_distribution<int> uni(0,(int)gMesh.V.size()-1);
