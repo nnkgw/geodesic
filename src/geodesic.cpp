@@ -2,7 +2,8 @@
 // Minimal .obj triangle mesh viewer + graph shortest path (Dijkstra on 1-skeleton)
 // Libraries: freeglut, OpenGL (fixed pipeline), glm
 // Usage: ./app model.obj
-// Keys: r (re-sample random endpoints), +/- zoom, arrows pan, mouse: L-rotate / R-pan, Esc quit
+// Keys: 1/2 switch method, Space overlay toggle, R re-sample endpoints,
+//       +/- zoom, mouse: L-rotate / R-pan, Esc quit
 // Mouse wheel zoom is available on FREEGLUT
 
 #if defined(WIN32)
@@ -60,9 +61,10 @@ struct Graph { // adjacency list on 1-skeleton
   std::vector<std::vector<std::pair<int,float>>> adj; // (neighbor, length)
 };
 
-// Include Dijkstra implementation AFTER Graph is defined.
-// This keeps compile errors away (the header needs the full definition of Graph).
+// Dijkstra header
 #include "dijkstra.h"
+// New: Selective Refinement stub header (delegates to Dijkstra for now)
+#include "selective_refinement.h"
 
 static Mesh gMesh;
 static Graph gGraph;
@@ -74,12 +76,18 @@ static glm::vec3 sceneCenter(0.0f);
 static float yaw=0.0f, pitch=0.0f; // radians
 static float panX=0.0f, panY=0.0f;
 static int lastX=-1, lastY=-1;
-
 static bool lbtn=false, rbtn=false;
 
-// path
+// method selection & overlay
+enum class Method { Dijkstra, SelectiveRefinement };
+static Method gActive = Method::Dijkstra;
+static bool   gOverlay = false;
+
+// paths
 static int srcIdx=-1, dstIdx=-1;
-static std::vector<int> pathVerts;
+static std::vector<int> pathVerts;      // kept for backward compatibility (unused for drawing now)
+static std::vector<int> pathDij;        // Dijkstra result
+static std::vector<int> pathSR;         // Selective Refinement result (currently same as Dijkstra)
 static std::mt19937 rng((unsigned)std::time(nullptr));
 
 static void computeBounds(Mesh& M){
@@ -150,7 +158,31 @@ static void buildGraph(const Mesh& M, Graph& G){
   }
 }
 
-// shortestPath(...) is now provided by dijkstra.h
+// New: draw a path given a vertex index polyline and color/width
+static void drawPathWith(const std::vector<int>& path, float r, float g, float b, float width){
+  if(path.size()<2) return;
+  glDisable(GL_LIGHTING);
+  glLineWidth(width);
+  glColor3f(r,g,b);
+  glBegin(GL_LINE_STRIP);
+  for(int vid : path){
+    auto &p = gMesh.V[vid];
+    glVertex3f(p.x,p.y,p.z);
+  }
+  glEnd();
+
+  // endpoints as small points
+  glPointSize(8.0f);
+  glBegin(GL_POINTS);
+  glVertex3f(gMesh.V[path.front()].x, gMesh.V[path.front()].y, gMesh.V[path.front()].z);
+  glVertex3f(gMesh.V[path.back()].x,  gMesh.V[path.back()].y,  gMesh.V[path.back()].z);
+  glEnd();
+}
+
+// Legacy helper (kept): draw global pathVerts in red
+static void drawPath(){
+  drawPathWith(pathVerts, 1.0f,0.1f,0.1f, 4.0f);
+}
 
 static void pickRandomEndpoints(){
   std::uniform_int_distribution<int> uni(0,(int)gMesh.V.size()-1);
@@ -161,12 +193,25 @@ static void pickRandomEndpoints(){
 
 static void recomputePath(){
   if(srcIdx<0 || dstIdx<0) pickRandomEndpoints();
-  pathVerts.clear();
-  bool ok = shortestPath(gGraph, srcIdx, dstIdx, pathVerts);
-  if(!ok){
-    for(int tries=0; tries<20 && !ok; ++tries){
+
+  // Baseline Dijkstra
+  pathDij.clear();
+  bool ok1 = shortestPath(gGraph, srcIdx, dstIdx, pathDij);
+
+  // Selective Refinement (stub -> calls Dijkstra for now)
+  pathSR.clear();
+  bool ok2 = selectiveRefinementPath(gMesh, gGraph, srcIdx, dstIdx, pathSR, SRParams{});
+
+  // Keep legacy pathVerts to not break older drawPath(); we mirror the active one
+  pathVerts = (gActive == Method::Dijkstra ? pathDij : pathSR);
+
+  // If either failed (disconnected graph), re-pick endpoints a few times
+  if(!(ok1 && ok2)){
+    for(int tries=0; tries<20 && !(ok1 && ok2); ++tries){
       pickRandomEndpoints();
-      ok = shortestPath(gGraph, srcIdx, dstIdx, pathVerts);
+      ok1 = shortestPath(gGraph, srcIdx, dstIdx, pathDij);
+      ok2 = selectiveRefinementPath(gMesh, gGraph, srcIdx, dstIdx, pathSR, SRParams{});
+      pathVerts = (gActive == Method::Dijkstra ? pathDij : pathSR);
     }
   }
 }
@@ -214,29 +259,6 @@ static void drawMeshWire(){
   glEnd();
 }
 
-static void drawPath(){
-  if(pathVerts.size()<2) return;
-  glDisable(GL_LIGHTING);
-  glLineWidth(4.0f);
-  glColor3f(1.0f,0.1f,0.1f);
-  glBegin(GL_LINE_STRIP);
-  for(int vid : pathVerts){
-    auto &p = gMesh.V[vid];
-    glVertex3f(p.x,p.y,p.z);
-  }
-  glEnd();
-
-  glPointSize(8.0f);
-  glBegin(GL_POINTS);
-  glColor3f(0.1f,0.9f,0.2f);
-  auto ps=gMesh.V[pathVerts.front()];
-  glVertex3f(ps.x,ps.y,ps.z);
-  glColor3f(0.1f,0.6f,1.0f);
-  auto pt=gMesh.V[pathVerts.back()];
-  glVertex3f(pt.x,pt.y,pt.z);
-  glEnd();
-}
-
 static void display(){
   glViewport(0,0,winW,winH);
   glClearColor(0.07f,0.08f,0.10f,1.0f);
@@ -245,7 +267,16 @@ static void display(){
 
   setProjection();
   drawMeshWire();
-  drawPath();
+
+  // Draw either active method or both (overlay)
+  if (gOverlay) {
+    // Dijkstra = red, SR = yellow
+    drawPathWith(pathDij, 1.0f,0.1f,0.1f, 4.0f);
+    drawPathWith(pathSR,  1.0f,0.9f,0.1f, 3.0f);
+  } else {
+    const std::vector<int>& activePath = (gActive==Method::Dijkstra) ? pathDij : pathSR;
+    drawPathWith(activePath, 1.0f,0.1f,0.1f, 4.0f);
+  }
 
   glutSwapBuffers();
 }
@@ -259,9 +290,28 @@ static void reshape(int w,int h){
 static void keyboard(unsigned char key,int,int){
   switch(key){
     case 27: std::exit(0); break;
-    case 'r': case 'R': pickRandomEndpoints(); recomputePath(); glutPostRedisplay(); break;
+    case 'r': case 'R':
+      pickRandomEndpoints(); recomputePath(); glutPostRedisplay(); break;
     case '+': camDist *= 0.9f; glutPostRedisplay(); break;
     case '-': camDist *= 1.1f; glutPostRedisplay(); break;
+
+    // New: method switching and overlay toggle
+    case '1':
+      gActive = Method::Dijkstra;
+      // keep legacy global in sync
+      pathVerts = pathDij;
+      glutPostRedisplay();
+      break;
+    case '2':
+      gActive = Method::SelectiveRefinement;
+      pathVerts = pathSR;
+      glutPostRedisplay();
+      break;
+    case ' ':
+      gOverlay = !gOverlay;
+      glutPostRedisplay();
+      break;
+
     default: break;
   }
 }
@@ -310,13 +360,16 @@ static void usage(){
 #endif
 
   std::puts("\nKeyboard:");
+  std::puts("  1           : select Dijkstra");
+  std::puts("  2           : select Selective Refinement (stub)");
+  std::puts("  Space       : overlay on/off (draw both)");
   std::puts("  R           : re-sample random endpoints");
   std::puts("  + / -       : zoom in / out");
   std::puts("  ESC         : quit");
 
   std::puts("\nNotes:");
-  std::puts("  - This demo computes a shortest path on the 1-skeleton (Dijkstra).");
-  std::puts("  - Use as a baseline before adding Steiner points / on-face edges.");
+  std::puts("  - The SR method currently delegates to Dijkstra (stub for future work).");
+  std::puts("  - Later, SR will add Steiner points and on-face edges around the path.");
   std::puts("");
 }
 
@@ -334,7 +387,7 @@ int main(int argc,char** argv){
   glutInit(&argc, argv);
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
   glutInitWindowSize(winW, winH);
-  glutCreateWindow("Shortest Path on Mesh (Dijkstra 1-skeleton)");
+  glutCreateWindow("Shortest Path on Mesh (Dijkstra & Selective Refinement)");
 
   usage();
 
