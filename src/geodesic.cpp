@@ -1,6 +1,6 @@
 // geodesic.cpp
 // Minimal .obj triangle mesh viewer + shortest path comparison
-// Methods: Dijkstra (1-skeleton), Selective Refinement (phase 1: ORIGINAL-edge subdivision)
+// Methods: Dijkstra (1-skeleton), Selective Refinement (phase 1 + ONFACE rungs)
 // Libraries: freeglut, OpenGL (fixed pipeline), glm
 // Usage: ./app model.obj
 
@@ -51,7 +51,7 @@ struct EdgeKeyHash {
 
 struct Mesh {
   std::vector<glm::vec3> V;         // vertices
-  std::vector<glm::ivec3> F;        // triangle indices (0-based)
+  std::vector<glm::ivec3> F;        // triangles (0-based)
   glm::vec3 bbmin{FLT_MAX}, bbmax{-FLT_MAX};
 };
 
@@ -80,8 +80,8 @@ static Method gActive = Method::Dijkstra;
 static bool   gOverlay = false;
 
 // SR params & debug toggles
-static SRParams gSRP{};       // gSRP.m controls the number of Steiner points per edge
-static bool gShowSRDebug = false; // overlay steiner points, refined edges, SR polyline
+static SRParams gSRP{};       // gSRP.m and gSRP.addOnFace
+static bool gShowSRDebug = false; // overlay steiner points, refined edges, SR path, on-face rungs
 
 // paths
 static int srcIdx=-1, dstIdx=-1;
@@ -92,6 +92,7 @@ static std::vector<int> pathSR;         // SR result collapsed to original verte
 static std::vector<glm::vec3> dbgSteinerPts; // cyan points
 static std::vector<std::pair<glm::vec3, glm::vec3>> dbgRefinedEdges; // cyan thin segments
 static std::vector<glm::vec3> dbgSRPolyline; // yellow thin polyline (includes Steiner nodes)
+static std::vector<std::pair<glm::vec3, glm::vec3>> dbgOnFaceEdges; // magenta segments
 
 static std::mt19937 rng((unsigned)std::time(nullptr));
 
@@ -170,7 +171,7 @@ static void pickRandomEndpoints(){
   srcIdx=a; dstIdx=b;
 }
 
-// New: helpers to draw primitives ------------------------------------------------
+// ---------- Drawing helpers ----------
 static void drawPolyline(const std::vector<glm::vec3>& poly, float r,float g,float b, float width){
   if(poly.size()<2) return;
   glDisable(GL_LIGHTING);
@@ -204,7 +205,6 @@ static void drawPoints(const std::vector<glm::vec3>& pts, float r,float g,float 
   glEnd();
 }
 
-// Existing draw function for paths on original vertices
 static void drawPathWithIndices(const std::vector<int>& path, float r,float g,float b, float width){
   if(path.size()<2) return;
   glDisable(GL_LIGHTING);
@@ -234,15 +234,16 @@ static void recomputePath(){
   pathDij.clear();
   bool ok1 = shortestPath(gGraph, srcIdx, dstIdx, pathDij);
 
-  // Selective Refinement (phase 1, with debug outputs)
+  // Selective Refinement (phase 1 + ONFACE, with debug outputs)
   pathSR.clear();
   dbgSteinerPts.clear();
   dbgRefinedEdges.clear();
   dbgSRPolyline.clear();
+  dbgOnFaceEdges.clear();
   bool ok2 = selectiveRefinementPath(
     gMesh, gGraph, srcIdx, dstIdx,
     pathSR, gSRP,
-    &dbgSteinerPts, &dbgRefinedEdges, &dbgSRPolyline
+    &dbgSteinerPts, &dbgRefinedEdges, &dbgSRPolyline, &dbgOnFaceEdges
   );
 
   if(!(ok1 && ok2)){
@@ -252,7 +253,7 @@ static void recomputePath(){
       ok2 = selectiveRefinementPath(
         gMesh, gGraph, srcIdx, dstIdx,
         pathSR, gSRP,
-        &dbgSteinerPts, &dbgRefinedEdges, &dbgSRPolyline
+        &dbgSteinerPts, &dbgRefinedEdges, &dbgSRPolyline, &dbgOnFaceEdges
       );
     }
   }
@@ -325,11 +326,13 @@ static void display(){
 
   // SR debug overlays (optional)
   if (gShowSRDebug) {
-    // Refined edges (thin cyan)
+    // Refined edge chains (thin cyan)
     drawSegments(dbgRefinedEdges, 0.2f, 1.0f, 1.0f, 1.5f);
+    // ON-FACE rung segments (thin magenta)
+    drawSegments(dbgOnFaceEdges, 1.0f, 0.2f, 0.9f, 1.5f);
     // Steiner points (cyan points)
     drawPoints(dbgSteinerPts, 0.2f, 1.0f, 1.0f, 5.0f);
-    // Refined SR polyline (yellow thin)
+    // SR path polyline (yellow thin)
     drawPolyline(dbgSRPolyline, 1.0f, 0.9f, 0.1f, 2.0f);
   }
 
@@ -365,6 +368,10 @@ static void keyboard(unsigned char key,int,int){
     case ']':
       if (gSRP.m < 16) { gSRP.m++; recomputePath(); glutPostRedisplay(); }
       break;
+
+    // Toggle ONFACE edges
+    case 'p': case 'P':
+      gSRP.addOnFace = !gSRP.addOnFace; recomputePath(); glutPostRedisplay(); break;
 
     default: break;
   }
@@ -415,18 +422,19 @@ static void usage(){
 
   std::puts("\nKeyboard:");
   std::puts("  1           : select Dijkstra");
-  std::puts("  2           : select Selective Refinement (phase 1)");
+  std::puts("  2           : select Selective Refinement (phase 1 + ONFACE)");
   std::puts("  Space       : overlay on/off (draw both)");
-  std::puts("  O           : toggle SR debug overlay (steiner/edges/polyline)");
+  std::puts("  O           : toggle SR debug overlay (steiner/edges/polyline/onface)");
   std::puts("  [ / ]       : decrease / increase m (Steiner points per subdivided edge)");
+  std::puts("  P           : toggle ONFACE rung edges on/off");
   std::puts("  R           : re-sample random endpoints");
   std::puts("  + / -       : zoom in / out");
   std::puts("  ESC         : quit");
 
   std::puts("\nNotes:");
   std::puts("  - SR (phase 1) subdivides ORIGINAL edges around the initial path into chains.");
-  std::puts("  - Debug overlay shows steiner points (cyan), refined edge chains (cyan),");
-  std::puts("    and the SR path polyline traversing steiner nodes (yellow).");
+  std::puts("  - ONFACE rungs connect corresponding subdivision nodes inside incident triangles.");
+  std::puts("  - Debug overlay colors: cyan (chains/points), magenta (onface), yellow (SR polyline).");
   std::puts("");
 }
 
@@ -440,15 +448,16 @@ int main(int argc,char** argv){
   initCamera();
   pickRandomEndpoints();
 
-  // Default SR parameter
-  gSRP.m = 2; // start with 2 steiner per subdivided edge for a visible overlay
+  // Default SR parameters
+  gSRP.m = 2;          // visible number of Steiner points per subdivided edge
+  gSRP.addOnFace = true;
 
   recomputePath();
 
   glutInit(&argc, argv);
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
   glutInitWindowSize(winW, winH);
-  glutCreateWindow("Shortest Path on Mesh (Dijkstra & SR Phase 1)");
+  glutCreateWindow("Shortest Path on Mesh (Dijkstra & SR Phase 1 + ONFACE)");
 
   usage();
 
