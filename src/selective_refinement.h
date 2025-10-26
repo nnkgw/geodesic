@@ -1,20 +1,20 @@
 #pragma once
 // selective_refinement.h
-// Header-only Selective Refinement (phase 1+ONFACE):
-// - Subdivide ORIGINAL edges incident to the initial path into m segments (Steiner nodes)
-// - Build a refined graph where target edges are replaced by chains
-// - Add ON-FACE "rungs" inside each incident triangle between subdivision-aligned nodes
-// - Run Dijkstra on the refined graph
-// - Return an "original-only" path for compatibility with the current renderer
-// Debug overlays (optional):
-//  - dbgSteinerPoints          : positions of all inserted Steiner nodes (cyan)
-//  - dbgRefinedEdges           : chain segments replacing subdivided ORIGINAL edges (cyan)
-//  - dbgSRPathPolyline         : SR path polyline including Steiner nodes (yellow)
-//  - dbgOnFaceEdges            : ONFACE rung segments inside incident triangles (magenta)
+// Header-only Selective Refinement (iterative):
+// - Iterate: (1) build a refined graph around the current original-only path
+//            (2) run Dijkstra on the refined graph
+//            (3) collapse to original-only path for the next iteration
+// - Stop when relative path-length change < eps or iteration reaches itmax.
+// - Supports:
+//    * ORIGINAL-edge subdivision (m steiner per target edge)
+//    * ON-FACE rungs inside incident triangles
+// - Returns an original-only path for compatibility with the current renderer.
+// - Optional debug overlays from the **final iteration**:
+//    * dbgSteinerPoints (cyan), dbgRefinedEdges (cyan)
+//    * dbgOnFaceEdges (magenta), dbgSRPathPolyline (yellow)
 //
 // Notes:
-//  - Comments are in English for public release.
-//  - Minimal-change philosophy to keep geodesic.cpp small.
+// - Comments are in English for public release.
 
 #include <vector>
 #include <unordered_set>
@@ -23,24 +23,25 @@
 #include <limits>
 #include <algorithm>
 #include <tuple>
+#include <cmath>
 
 #include "dijkstra.h"
 #include <glm/vec3.hpp>
 #include <glm/geometric.hpp>
 
 struct SRParams {
-  float gamma = 0.04f; // not used in this step
-  int   m     = 1;     // number of Steiner points per subdivided edge (>=1)
-  float eps   = 1e-3f; // not used in this step
-  int   itmax = 10;    // not used in this step
-  bool  addOnFace = true; // enable adding on-face rungs between subdivided edges
+  float gamma   = 0.04f;  // not used in this step
+  int   m       = 2;      // steiner points per subdivided edge (>=1 recommended)
+  float eps     = 1e-3f;  // relative convergence threshold on path length
+  int   itmax   = 10;     // maximum refinement iterations
+  bool  addOnFace = true; // add ON-FACE rung edges
 };
 
-// Forward declarations for interop with the app's types.
+// Forward declarations matching app's types.
 struct Mesh;
 struct Graph;
 
-// Undirected edge key for hashing/uniqueness.
+// Undirected edge key
 struct SR_EdgeKey {
   int a, b;
   SR_EdgeKey() : a(-1), b(-1) {}
@@ -53,11 +54,11 @@ struct SR_EdgeKeyHash {
   }
 };
 
-// Reverse map entry for steiner index -> original edge & which segment node.
+// Reverse map entry for steiner id -> original edge & segment id.
 struct SR_SteinerLUT {
   int i = -1; // original endpoint
   int j = -1; // original endpoint
-  int k = -1; // 0..m-1 (which subdivision along the chain)
+  int k = -1; // 0..m-1 (which subdivision)
   int m = 0;  // total steiner per edge
 };
 
@@ -67,19 +68,16 @@ inline glm::vec3 sr_vertex_position(const Mesh& M,
                                     int n_orig,
                                     const std::vector<SR_SteinerLUT>* lut)
 {
-  if (v >= 0 && v < n_orig) {
-    return M.V[v];
-  }
-  if (!lut) return glm::vec3(0.0f); // caller should pass lut when steiner nodes are present
+  if (v >= 0 && v < n_orig) return M.V[v];
+  if (!lut) return glm::vec3(0.0f);
   const SR_SteinerLUT& e = (*lut)[v - n_orig];
   const float t = float(e.k + 1) / float(e.m + 1);
   return (1.0f - t) * M.V[e.i] + t * M.V[e.j];
 }
 
-// Build refined graph by subdividing ORIGINAL edges incident to the initial path.
-// Add ON-FACE rungs inside each triangle between aligned subdivision nodes.
-// Also fill 'lut' for steiner-node -> (i,j,k,m) reverse mapping.
-// Optionally, emit ONFACE rung segments for debug (world-space) via dbgOnFaceSegs.
+// Build refined graph around an original-only path: subdivide incident ORIGINAL edges,
+// and optionally add ON-FACE rungs inside incident triangles.
+// Optionally fills: 'lut' (steiner reverse map), 'dbgOnFaceSegs' (world-space rungs).
 inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
                                                     const Graph& G0,
                                                     const std::vector<int>& path0,
@@ -94,7 +92,7 @@ inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
   const int n = (int)G0.adj.size();
   n_orig_out = n;
 
-  // Mark vertices on the initial path.
+  // Mark vertices on the current original-only path.
   std::vector<char> on_path(n, 0);
   for (int v : path0) if (0 <= v && v < n) on_path[v] = 1;
 
@@ -142,7 +140,6 @@ inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
   if (m_per_edge > 0) {
     for (const auto& ek : sub_edges) {
       steiner_base[ek] = next_idx;
-      // Fill LUT entries for this edge
       if (lut) {
         for (int k = 0; k < m_per_edge; ++k) {
           const int global_idx = next_idx + k;
@@ -169,10 +166,8 @@ inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
 
     auto it = sub_edges.find(ek);
     if (it == sub_edges.end() || m_per_edge == 0) {
-      // Keep original edge.
       add_undirected(i, j, w_ij);
     } else {
-      // Replace by chain i - s1 - ... - sm - j
       const float seg_w = w_ij / float(m_per_edge + 1);
       int prev = i;
       const int base = steiner_base[ek];
@@ -185,9 +180,7 @@ inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
     }
   }
 
-  // ONFACE rungs inside incident triangles (optional).
-  // For each triangle, for each pair of its edges that are subdivided,
-  // connect steiner nodes with the same subdivision index k.
+  // ON-FACE rungs between aligned subdivision nodes (optional).
   if (addOnFace && m_per_edge > 0) {
     auto add_onface_between = [&](const SR_EdgeKey& e1, const SR_EdgeKey& e2){
       auto it1 = steiner_base.find(e1);
@@ -209,8 +202,6 @@ inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
     for (const auto& tri : M.F) {
       const int a = tri.x, b = tri.y, c = tri.z;
       SR_EdgeKey ab(a,b), bc(b,c), ca(c,a);
-      // Only faces incident to the initial path will actually have these edges in sub_edges;
-      // we simply attempt to build rungs where both edges are subdivided.
       add_onface_between(ab, bc);
       add_onface_between(bc, ca);
       add_onface_between(ca, ab);
@@ -218,7 +209,7 @@ inline void sr_build_refined_graph_edge_subdivision(const Mesh& M,
   }
 }
 
-// Collapse a refined path back to ORIGINAL vertex IDs (drop steiner nodes).
+// Collapse refined path back to ORIGINAL vertex IDs.
 inline void sr_collapse_to_original_vertices(const std::vector<int>& path_ref,
                                              int n_orig,
                                              std::vector<int>& path_orig_only)
@@ -235,13 +226,30 @@ inline void sr_collapse_to_original_vertices(const std::vector<int>& path_ref,
   }
 }
 
-// Public API (phase 1 + ONFACE):
+// Compute polyline length in 3D for a refined path (may include steiner).
+inline float sr_polyline_length(const Mesh& M,
+                                const std::vector<int>& path_ref,
+                                int n_orig,
+                                const std::vector<SR_SteinerLUT>* lut)
+{
+  if (path_ref.size() < 2) return 0.0f;
+  float L = 0.0f;
+  glm::vec3 prev = sr_vertex_position(M, path_ref[0], n_orig, lut);
+  for (size_t i = 1; i < path_ref.size(); ++i) {
+    glm::vec3 cur = sr_vertex_position(M, path_ref[i], n_orig, lut);
+    L += glm::length(cur - prev);
+    prev = cur;
+  }
+  return L;
+}
+
+// Public API (iterative SR with eps/itmax):
 inline bool selectiveRefinementPath(const Mesh& M,
                                     const Graph& G0,
                                     int s, int t,
                                     std::vector<int>& outPath,
                                     const SRParams& P = {},
-                                    // Optional debug outputs (pass nullptr to ignore)
+                                    // Optional debug outputs (final iteration)
                                     std::vector<glm::vec3>* dbgSteinerPoints = nullptr,
                                     std::vector<std::pair<glm::vec3, glm::vec3>>* dbgRefinedEdges = nullptr,
                                     std::vector<glm::vec3>* dbgSRPathPolyline = nullptr,
@@ -251,90 +259,134 @@ inline bool selectiveRefinementPath(const Mesh& M,
   const int n = (int)G0.adj.size();
   if (n == 0 || s < 0 || s >= n || t < 0 || t >= n) return false;
 
-  // 1) Initial path on original graph
-  std::vector<int> path0;
-  if (!shortestPath(G0, s, t, path0)) return false;
+  // Initial path on the original graph
+  std::vector<int> path_orig;
+  if (!shortestPath(G0, s, t, path_orig)) return false;
 
-  // 2) Refined graph + LUT for steiner nodes (+ONFACE rung debug)
-  Graph Gref;
-  int n_orig = 0, n_ref = 0;
-  std::vector<SR_SteinerLUT> lut; // size = num_new steiner nodes
-  sr_build_refined_graph_edge_subdivision(
-    M, G0, path0, std::max(1, P.m),
-    Gref, n_orig, n_ref,
-    (dbgSteinerPoints || dbgRefinedEdges || dbgSRPathPolyline || dbgOnFaceEdges) ? &lut : nullptr,
-    dbgOnFaceEdges,
-    P.addOnFace
-  );
+  // Iteration state
+  float lastL = std::numeric_limits<float>::infinity();
+  std::vector<int> best_path_orig = path_orig;
 
-  // 3) Run Dijkstra on refined graph
-  std::vector<int> path_ref;
-  if (!shortestPath(Gref, s, t, path_ref)) {
-    outPath = path0; // fallback
-    return true;
-  }
+  // Buffers for the last iteration (for debug export)
+  std::vector<SR_SteinerLUT> last_lut;
+  std::vector<glm::vec3> last_dbgSteiner;
+  std::vector<std::pair<glm::vec3, glm::vec3>> last_dbgRefined;
+  std::vector<std::pair<glm::vec3, glm::vec3>> last_dbgOnFace;
+  std::vector<glm::vec3> last_dbgSRpoly;
 
-  // 4) Collapse to original-only indices for current renderer
-  sr_collapse_to_original_vertices(path_ref, n_orig, outPath);
-  if (outPath.size() < 2) outPath = path0;
+  const int itmax = std::max(1, P.itmax);
+  const int m_use = std::max(1, P.m);
+  const float eps = std::max(0.0f, P.eps);
 
-  // 5) Optional debug overlays ------------------------------------------------
-  if (dbgSteinerPoints || dbgRefinedEdges || dbgSRPathPolyline) {
-    // 5.1 Steiner points
-    if (dbgSteinerPoints) {
-      dbgSteinerPoints->clear();
-      dbgSteinerPoints->reserve(lut.size());
-      for (size_t idx = 0; idx < lut.size(); ++idx) {
-        const glm::vec3 p = sr_vertex_position(M, (int)(n_orig + idx), n_orig, &lut);
-        dbgSteinerPoints->push_back(p);
-      }
+  for (int it = 0; it < itmax; ++it) {
+    // 1) Build refined graph around current original-only path
+    Graph Gref;
+    int n_orig = 0, n_ref = 0;
+    std::vector<SR_SteinerLUT> lut;
+    std::vector<std::pair<glm::vec3, glm::vec3>> onface_debug;
+
+    sr_build_refined_graph_edge_subdivision(
+      M, G0, path_orig, m_use,
+      Gref, n_orig, n_ref,
+      (dbgSteinerPoints || dbgRefinedEdges || dbgSRPathPolyline || dbgOnFaceEdges) ? &lut : nullptr,
+      (dbgOnFaceEdges ? &onface_debug : nullptr),
+      P.addOnFace
+    );
+
+    // 2) Run Dijkstra on refined graph
+    std::vector<int> path_ref;
+    if (!shortestPath(Gref, s, t, path_ref)) {
+      // If refined graph fails, keep the last good result
+      break;
     }
-    // 5.2 Refined edges (chains along subdivided ORIGINAL edges)
-    if (dbgRefinedEdges) {
-      dbgRefinedEdges->clear();
-      // Rebuild edge sets and the same base assignment order
-      std::unordered_set<SR_EdgeKey, SR_EdgeKeyHash> all_edges, sub_edges;
-      std::vector<char> on_path(n_orig, 0);
-      for (int v : path0) if (0 <= v && v < n_orig) on_path[v] = 1;
-      for (int u = 0; u < n_orig; ++u) {
-        for (const auto& kv : G0.adj[u]) {
-          int v = kv.first;
-          if (v < 0 || v >= n_orig || v == u) continue;
-          SR_EdgeKey ek(u, v);
-          if (all_edges.insert(ek).second) {
-            if (on_path[u] || on_path[v]) sub_edges.insert(ek);
+
+    // 3) Measure refined path length (3D)
+    const float curL = sr_polyline_length(M, path_ref, n_orig,
+                          (dbgSteinerPoints || dbgRefinedEdges || dbgSRPathPolyline || dbgOnFaceEdges) ? &lut : nullptr);
+
+    // Keep debug buffers from this iteration (overwrite each round)
+    if (dbgSteinerPoints || dbgRefinedEdges || dbgSRPathPolyline || dbgOnFaceEdges) {
+      // steiner points
+      last_dbgSteiner.clear();
+      last_dbgSteiner.reserve(lut.size());
+      for (size_t idx = 0; idx < lut.size(); ++idx) {
+        last_dbgSteiner.push_back(sr_vertex_position(M, (int)(n_orig + idx), n_orig, &lut));
+      }
+      // refined chains: rebuild assignment order consistent with builder
+      last_dbgRefined.clear();
+      {
+        std::unordered_set<SR_EdgeKey, SR_EdgeKeyHash> all_edges, sub_edges;
+        std::vector<char> on_path(n_orig, 0);
+        for (int v : path_orig) if (0 <= v && v < n_orig) on_path[v] = 1;
+        for (int u = 0; u < n_orig; ++u) {
+          for (const auto& kv : G0.adj[u]) {
+            int v = kv.first;
+            if (v < 0 || v >= n_orig || v == u) continue;
+            SR_EdgeKey ek(u, v);
+            if (all_edges.insert(ek).second) {
+              if (on_path[u] || on_path[v]) sub_edges.insert(ek);
+            }
           }
         }
-      }
-      const int m_per_edge = std::max(1, P.m);
-      std::unordered_map<SR_EdgeKey, int, SR_EdgeKeyHash> steiner_base;
-      int next_idx = n_orig;
-      for (const auto& ek : sub_edges) {
-        steiner_base[ek] = next_idx;
-        next_idx += m_per_edge;
-      }
-      auto pos_of = [&](int idx)->glm::vec3 { return sr_vertex_position(M, idx, n_orig, &lut); };
-      for (const auto& ek : sub_edges) {
-        const int i = ek.a, j = ek.b;
-        const int base = steiner_base[ek];
-        int prev = i;
-        for (int k = 0; k < m_per_edge; ++k) {
-          int cur = base + k;
-          dbgRefinedEdges->push_back({ pos_of(prev), pos_of(cur) });
-          prev = cur;
+        std::unordered_map<SR_EdgeKey, int, SR_EdgeKeyHash> steiner_base;
+        int next_idx = n_orig;
+        for (const auto& ek : sub_edges) {
+          steiner_base[ek] = next_idx;
+          next_idx += m_use;
         }
-        dbgRefinedEdges->push_back({ pos_of(prev), pos_of(j) });
+        auto pos_of = [&](int idx)->glm::vec3 { return sr_vertex_position(M, idx, n_orig, &lut); };
+        for (const auto& ek : sub_edges) {
+          const int i = ek.a, j = ek.b;
+          const int base = steiner_base[ek];
+          int prev = i;
+          for (int k = 0; k < m_use; ++k) {
+            int cur = base + k;
+            last_dbgRefined.push_back({ pos_of(prev), pos_of(cur) });
+            prev = cur;
+          }
+          last_dbgRefined.push_back({ pos_of(prev), pos_of(j) });
+        }
+      }
+      // on-face
+      last_dbgOnFace = std::move(onface_debug);
+      // SR polyline
+      last_dbgSRpoly.clear();
+      last_dbgSRpoly.reserve(path_ref.size());
+      for (int v : path_ref) last_dbgSRpoly.push_back(sr_vertex_position(M, v, n_orig, &lut));
+      // store lut for potential external use (not exported directly)
+      last_lut = std::move(lut);
+    }
+
+    // 4) Collapse refined path to original-only for the next iteration
+    std::vector<int> next_path_orig;
+    sr_collapse_to_original_vertices(path_ref, n_orig, next_path_orig);
+    if (next_path_orig.size() < 2) {
+      // degenerate; stop with current best
+      break;
+    }
+
+    // 5) Convergence test (relative change)
+    if (std::isfinite(lastL)) {
+      const float rel = std::fabs(curL - lastL) / std::max(curL, 1e-6f);
+      if (rel < eps) {
+        best_path_orig = next_path_orig;
+        break;
       }
     }
-    // 5.3 SR path polyline (including steiner)
-    if (dbgSRPathPolyline) {
-      dbgSRPathPolyline->clear();
-      dbgSRPathPolyline->reserve(path_ref.size());
-      for (int v : path_ref) {
-        dbgSRPathPolyline->push_back(sr_vertex_position(M, v, n_orig, &lut));
-      }
-    }
+    // prepare next round
+    lastL = curL;
+    best_path_orig = next_path_orig;
+    path_orig.swap(next_path_orig);
   }
 
-  return true;
+  // Output the best original-only path
+  outPath = best_path_orig;
+
+  // Export debug overlays from the final iteration
+  if (dbgSteinerPoints)   *dbgSteinerPoints   = std::move(last_dbgSteiner);
+  if (dbgRefinedEdges)    *dbgRefinedEdges    = std::move(last_dbgRefined);
+  if (dbgOnFaceEdges)     *dbgOnFaceEdges     = std::move(last_dbgOnFace);
+  if (dbgSRPathPolyline)  *dbgSRPathPolyline  = std::move(last_dbgSRpoly);
+
+  return (outPath.size() >= 2);
 }
