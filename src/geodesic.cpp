@@ -1,10 +1,8 @@
 // geodesic.cpp
-// Minimal .obj triangle mesh viewer + graph shortest path (Dijkstra on 1-skeleton)
+// Minimal .obj triangle mesh viewer + shortest path comparison
+// Methods: Dijkstra (1-skeleton), Selective Refinement (phase 1: ORIGINAL-edge subdivision)
 // Libraries: freeglut, OpenGL (fixed pipeline), glm
 // Usage: ./app model.obj
-// Keys: 1/2 switch method, Space overlay toggle, R re-sample endpoints,
-//       +/- zoom, mouse: L-rotate / R-pan, Esc quit
-// Mouse wheel zoom is available on FREEGLUT
 
 #if defined(WIN32)
 #pragma warning(disable:4996)
@@ -61,9 +59,7 @@ struct Graph { // adjacency list on 1-skeleton
   std::vector<std::vector<std::pair<int,float>>> adj; // (neighbor, length)
 };
 
-// Dijkstra header
 #include "dijkstra.h"
-// New: Selective Refinement stub header (delegates to Dijkstra for now)
 #include "selective_refinement.h"
 
 static Mesh gMesh;
@@ -83,11 +79,20 @@ enum class Method { Dijkstra, SelectiveRefinement };
 static Method gActive = Method::Dijkstra;
 static bool   gOverlay = false;
 
+// SR params & debug toggles
+static SRParams gSRP{};       // gSRP.m controls the number of Steiner points per edge
+static bool gShowSRDebug = false; // overlay steiner points, refined edges, SR polyline
+
 // paths
 static int srcIdx=-1, dstIdx=-1;
-static std::vector<int> pathVerts;      // kept for backward compatibility (unused for drawing now)
-static std::vector<int> pathDij;        // Dijkstra result
-static std::vector<int> pathSR;         // Selective Refinement result (currently same as Dijkstra)
+static std::vector<int> pathDij;        // Dijkstra result (original vertex ids)
+static std::vector<int> pathSR;         // SR result collapsed to original vertex ids
+
+// debug overlays from SR
+static std::vector<glm::vec3> dbgSteinerPts; // cyan points
+static std::vector<std::pair<glm::vec3, glm::vec3>> dbgRefinedEdges; // cyan thin segments
+static std::vector<glm::vec3> dbgSRPolyline; // yellow thin polyline (includes Steiner nodes)
+
 static std::mt19937 rng((unsigned)std::time(nullptr));
 
 static void computeBounds(Mesh& M){
@@ -144,7 +149,7 @@ static void buildGraph(const Mesh& M, Graph& G){
   std::unordered_set<EdgeKey,EdgeKeyHash> used;
   used.reserve(M.F.size()*3);
   for(auto &f: M.F){
-    int id[3]={f.x,f.y,f.z}; // triangle vtx0, vtx1, vtx2
+    int id[3]={f.x,f.y,f.z};
     for(int e=0;e<3;++e){
       int i=id[e], j=id[(e+1)%3];
       EdgeKey key(i,j);
@@ -158,32 +163,6 @@ static void buildGraph(const Mesh& M, Graph& G){
   }
 }
 
-// New: draw a path given a vertex index polyline and color/width
-static void drawPathWith(const std::vector<int>& path, float r, float g, float b, float width){
-  if(path.size()<2) return;
-  glDisable(GL_LIGHTING);
-  glLineWidth(width);
-  glColor3f(r,g,b);
-  glBegin(GL_LINE_STRIP);
-  for(int vid : path){
-    auto &p = gMesh.V[vid];
-    glVertex3f(p.x,p.y,p.z);
-  }
-  glEnd();
-
-  // endpoints as small points
-  glPointSize(8.0f);
-  glBegin(GL_POINTS);
-  glVertex3f(gMesh.V[path.front()].x, gMesh.V[path.front()].y, gMesh.V[path.front()].z);
-  glVertex3f(gMesh.V[path.back()].x,  gMesh.V[path.back()].y,  gMesh.V[path.back()].z);
-  glEnd();
-}
-
-// Legacy helper (kept): draw global pathVerts in red
-static void drawPath(){
-  drawPathWith(pathVerts, 1.0f,0.1f,0.1f, 4.0f);
-}
-
 static void pickRandomEndpoints(){
   std::uniform_int_distribution<int> uni(0,(int)gMesh.V.size()-1);
   int a=uni(rng), b=uni(rng);
@@ -191,27 +170,90 @@ static void pickRandomEndpoints(){
   srcIdx=a; dstIdx=b;
 }
 
+// New: helpers to draw primitives ------------------------------------------------
+static void drawPolyline(const std::vector<glm::vec3>& poly, float r,float g,float b, float width){
+  if(poly.size()<2) return;
+  glDisable(GL_LIGHTING);
+  glColor3f(r,g,b);
+  glLineWidth(width);
+  glBegin(GL_LINE_STRIP);
+  for(const auto& p : poly) glVertex3f(p.x,p.y,p.z);
+  glEnd();
+}
+
+static void drawSegments(const std::vector<std::pair<glm::vec3,glm::vec3>>& segs, float r,float g,float b, float width){
+  if(segs.empty()) return;
+  glDisable(GL_LIGHTING);
+  glColor3f(r,g,b);
+  glLineWidth(width);
+  glBegin(GL_LINES);
+  for(const auto& s : segs){
+    glVertex3f(s.first.x, s.first.y, s.first.z);
+    glVertex3f(s.second.x, s.second.y, s.second.z);
+  }
+  glEnd();
+}
+
+static void drawPoints(const std::vector<glm::vec3>& pts, float r,float g,float b, float size){
+  if(pts.empty()) return;
+  glDisable(GL_LIGHTING);
+  glColor3f(r,g,b);
+  glPointSize(size);
+  glBegin(GL_POINTS);
+  for(const auto& p : pts) glVertex3f(p.x,p.y,p.z);
+  glEnd();
+}
+
+// Existing draw function for paths on original vertices
+static void drawPathWithIndices(const std::vector<int>& path, float r,float g,float b, float width){
+  if(path.size()<2) return;
+  glDisable(GL_LIGHTING);
+  glColor3f(r,g,b);
+  glLineWidth(width);
+  glBegin(GL_LINE_STRIP);
+  for(int vid : path){
+    const auto& p = gMesh.V[vid];
+    glVertex3f(p.x,p.y,p.z);
+  }
+  glEnd();
+
+  glPointSize(8.0f);
+  glBegin(GL_POINTS);
+  const auto& ps=gMesh.V[path.front()];
+  const auto& pt=gMesh.V[path.back()];
+  glVertex3f(ps.x,ps.y,ps.z);
+  glVertex3f(pt.x,pt.y,pt.z);
+  glEnd();
+}
+
+// Recompute both methods and debug overlays
 static void recomputePath(){
   if(srcIdx<0 || dstIdx<0) pickRandomEndpoints();
 
-  // Baseline Dijkstra
+  // Dijkstra baseline
   pathDij.clear();
   bool ok1 = shortestPath(gGraph, srcIdx, dstIdx, pathDij);
 
-  // Selective Refinement (stub -> calls Dijkstra for now)
+  // Selective Refinement (phase 1, with debug outputs)
   pathSR.clear();
-  bool ok2 = selectiveRefinementPath(gMesh, gGraph, srcIdx, dstIdx, pathSR, SRParams{});
+  dbgSteinerPts.clear();
+  dbgRefinedEdges.clear();
+  dbgSRPolyline.clear();
+  bool ok2 = selectiveRefinementPath(
+    gMesh, gGraph, srcIdx, dstIdx,
+    pathSR, gSRP,
+    &dbgSteinerPts, &dbgRefinedEdges, &dbgSRPolyline
+  );
 
-  // Keep legacy pathVerts to not break older drawPath(); we mirror the active one
-  pathVerts = (gActive == Method::Dijkstra ? pathDij : pathSR);
-
-  // If either failed (disconnected graph), re-pick endpoints a few times
   if(!(ok1 && ok2)){
     for(int tries=0; tries<20 && !(ok1 && ok2); ++tries){
       pickRandomEndpoints();
       ok1 = shortestPath(gGraph, srcIdx, dstIdx, pathDij);
-      ok2 = selectiveRefinementPath(gMesh, gGraph, srcIdx, dstIdx, pathSR, SRParams{});
-      pathVerts = (gActive == Method::Dijkstra ? pathDij : pathSR);
+      ok2 = selectiveRefinementPath(
+        gMesh, gGraph, srcIdx, dstIdx,
+        pathSR, gSRP,
+        &dbgSteinerPts, &dbgRefinedEdges, &dbgSRPolyline
+      );
     }
   }
 }
@@ -268,14 +310,27 @@ static void display(){
   setProjection();
   drawMeshWire();
 
-  // Draw either active method or both (overlay)
+  // Overlay or single method
   if (gOverlay) {
-    // Dijkstra = red, SR = yellow
-    drawPathWith(pathDij, 1.0f,0.1f,0.1f, 4.0f);
-    drawPathWith(pathSR,  1.0f,0.9f,0.1f, 3.0f);
+    // Dijkstra (red) vs SR (orange/red)
+    drawPathWithIndices(pathDij, 1.0f,0.1f,0.1f, 4.0f);
+    drawPathWithIndices(pathSR,  1.0f,0.9f,0.1f, 3.0f);
   } else {
-    const std::vector<int>& activePath = (gActive==Method::Dijkstra) ? pathDij : pathSR;
-    drawPathWith(activePath, 1.0f,0.1f,0.1f, 4.0f);
+    if (gActive == Method::Dijkstra) {
+      drawPathWithIndices(pathDij, 1.0f,0.1f,0.1f, 4.0f);
+    } else {
+      drawPathWithIndices(pathSR,  1.0f,0.1f,0.1f, 4.0f);
+    }
+  }
+
+  // SR debug overlays (optional)
+  if (gShowSRDebug) {
+    // Refined edges (thin cyan)
+    drawSegments(dbgRefinedEdges, 0.2f, 1.0f, 1.0f, 1.5f);
+    // Steiner points (cyan points)
+    drawPoints(dbgSteinerPts, 0.2f, 1.0f, 1.0f, 5.0f);
+    // Refined SR polyline (yellow thin)
+    drawPolyline(dbgSRPolyline, 1.0f, 0.9f, 0.1f, 2.0f);
   }
 
   glutSwapBuffers();
@@ -286,7 +341,6 @@ static void reshape(int w,int h){
   glutPostRedisplay();
 }
 
-// ---------- Keyboard ----------
 static void keyboard(unsigned char key,int,int){
   switch(key){
     case 27: std::exit(0); break;
@@ -295,21 +349,21 @@ static void keyboard(unsigned char key,int,int){
     case '+': camDist *= 0.9f; glutPostRedisplay(); break;
     case '-': camDist *= 1.1f; glutPostRedisplay(); break;
 
-    // New: method switching and overlay toggle
-    case '1':
-      gActive = Method::Dijkstra;
-      // keep legacy global in sync
-      pathVerts = pathDij;
-      glutPostRedisplay();
+    // Method switching
+    case '1': gActive = Method::Dijkstra; glutPostRedisplay(); break;
+    case '2': gActive = Method::SelectiveRefinement; glutPostRedisplay(); break;
+    case ' ': gOverlay = !gOverlay; glutPostRedisplay(); break;
+
+    // SR debug overlay toggle
+    case 'o': case 'O':
+      gShowSRDebug = !gShowSRDebug; glutPostRedisplay(); break;
+
+    // Change SR parameter m (number of Steiner points per subdivided edge)
+    case '[':
+      if (gSRP.m > 1) { gSRP.m--; recomputePath(); glutPostRedisplay(); }
       break;
-    case '2':
-      gActive = Method::SelectiveRefinement;
-      pathVerts = pathSR;
-      glutPostRedisplay();
-      break;
-    case ' ':
-      gOverlay = !gOverlay;
-      glutPostRedisplay();
+    case ']':
+      if (gSRP.m < 16) { gSRP.m++; recomputePath(); glutPostRedisplay(); }
       break;
 
     default: break;
@@ -361,15 +415,18 @@ static void usage(){
 
   std::puts("\nKeyboard:");
   std::puts("  1           : select Dijkstra");
-  std::puts("  2           : select Selective Refinement (stub)");
+  std::puts("  2           : select Selective Refinement (phase 1)");
   std::puts("  Space       : overlay on/off (draw both)");
+  std::puts("  O           : toggle SR debug overlay (steiner/edges/polyline)");
+  std::puts("  [ / ]       : decrease / increase m (Steiner points per subdivided edge)");
   std::puts("  R           : re-sample random endpoints");
   std::puts("  + / -       : zoom in / out");
   std::puts("  ESC         : quit");
 
   std::puts("\nNotes:");
-  std::puts("  - The SR method currently delegates to Dijkstra (stub for future work).");
-  std::puts("  - Later, SR will add Steiner points and on-face edges around the path.");
+  std::puts("  - SR (phase 1) subdivides ORIGINAL edges around the initial path into chains.");
+  std::puts("  - Debug overlay shows steiner points (cyan), refined edge chains (cyan),");
+  std::puts("    and the SR path polyline traversing steiner nodes (yellow).");
   std::puts("");
 }
 
@@ -382,12 +439,16 @@ int main(int argc,char** argv){
   buildGraph(gMesh, gGraph);
   initCamera();
   pickRandomEndpoints();
+
+  // Default SR parameter
+  gSRP.m = 2; // start with 2 steiner per subdivided edge for a visible overlay
+
   recomputePath();
 
   glutInit(&argc, argv);
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
   glutInitWindowSize(winW, winH);
-  glutCreateWindow("Shortest Path on Mesh (Dijkstra & Selective Refinement)");
+  glutCreateWindow("Shortest Path on Mesh (Dijkstra & SR Phase 1)");
 
   usage();
 
