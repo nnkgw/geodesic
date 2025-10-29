@@ -7,4 +7,4 @@
 <img src="https://github.com/nnkgw/geodesic/blob/main/images/tether.gif" title="tether"/>
 
 # geodesic
-This project demonstrates how to compute and visualize the shortest path on a polygonal surface.
+Unofficial implementation of "Approximate Shortest Path on a Polyhedral Surface Based on Selective Refinement of the Discrete Graph and Its Applications"
